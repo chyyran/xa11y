@@ -13,6 +13,13 @@ impl WindowsProvider {
             message: "Windows backend only available on Windows".to_string(),
         })
     }
+
+    /// Resolve a native top-level window into an accessibility element.
+    pub fn element_from_native_window(&self, _: isize) -> Result<ElementData> {
+        Err(Error::Unsupported {
+            feature: "native Windows accessibility window lookup".to_owned(),
+        })
+    }
 }
 
 #[derive(Default)]

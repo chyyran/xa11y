@@ -1,5 +1,7 @@
 //! Windows UI Automation accessibility provider.
 
+mod native_window;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,6 +31,11 @@ static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 /// success. See: https://github.com/xa11y/xa11y/issues/169
 const EVENT_E_ALL_SUBSCRIBERS_FAILED: windows::core::HRESULT =
     windows::core::HRESULT(0x80040201u32 as i32);
+
+/// `UIA_E_TIMEOUT` (0x80131505) — the target provider did not answer a UIA
+/// request before UI Automation's own timeout expired. Providers can return
+/// this briefly while constructing a newly shown tree (observed with Qt 6).
+const UIA_E_TIMEOUT: windows::core::HRESULT = windows::core::HRESULT(0x80131505u32 as i32);
 
 fn is_event_subscriber_failure(e: &windows::core::Error) -> bool {
     e.code() == EVENT_E_ALL_SUBSCRIBERS_FAILED
@@ -118,33 +125,6 @@ impl WindowsProvider {
         // AccessKit provider was never activated. Retry first so a foreign
         // app's momentary busy-ness doesn't quietly degrade the result.
         retry_transient(|| unsafe { self.automation.ElementFromHandle(hwnd) }).map_err(|_| ())
-    }
-
-    /// Find an application's root UIA element + window name by PID.
-    ///
-    /// Used by `subscribe_impl` to scope native UIA event handlers to a
-    /// single application's subtree.
-    fn find_app_by_pid(&self, pid: u32) -> Result<(IUIAutomationElement, String)> {
-        let root = uia_call(|| unsafe { self.automation.GetRootElement() })?;
-        let condition = uia_call(|| unsafe {
-            self.automation
-                .CreatePropertyCondition(UIA_ProcessIdPropertyId, &VARIANT::from(pid as i32))
-        })?;
-        let el = unsafe { root.FindFirst(TreeScope_Children, &condition) }.map_err(|_| {
-            Error::Platform {
-                code: -1,
-                message: format!("No window found for PID {}", pid),
-            }
-        })?;
-
-        // Re-acquire via HWND to activate AccessKit provider
-        let el = self.reacquire_via_hwnd(&el).unwrap_or(el);
-
-        let name = unsafe { el.CurrentName() }
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-
-        Ok((el, name))
     }
 
     /// Cache a UIA element and return its handle ID.
@@ -397,7 +377,7 @@ fn is_com_server_busy(e: &windows::core::Error) -> bool {
 /// attempt, so this stays a retry of specifically-classified transient
 /// failures rather than a fallback chain (tenet 1).
 fn is_transient(e: &windows::core::Error) -> bool {
-    is_event_subscriber_failure(e) || is_com_server_busy(e)
+    is_event_subscriber_failure(e) || is_com_server_busy(e) || e.code() == UIA_E_TIMEOUT
 }
 
 /// Retry a COM call while it fails transiently, preserving the raw HRESULT.
@@ -430,7 +410,9 @@ fn retry_transient<T>(f: impl Fn() -> windows::core::Result<T>) -> windows::core
 /// already completed (#169); a query needs a value, so it is retried.
 /// See: https://github.com/xa11y/xa11y/issues/257
 ///
-/// The COM server-busy family — see [`is_com_server_busy`].
+/// The COM server-busy family — see [`is_com_server_busy`] — and
+/// `UIA_E_TIMEOUT`, which can be returned while a provider is constructing a
+/// newly shown accessibility tree.
 ///
 /// Any other error is returned immediately.
 fn uia_call<T>(f: impl Fn() -> windows::core::Result<T>) -> Result<T> {
@@ -1860,7 +1842,18 @@ impl Provider for WindowsProvider {
             message: "Element has no PID for subscribe".to_string(),
         })?;
         let app_name = element.name.clone().unwrap_or_default();
-        self.subscribe_impl(pid, app_name)
+        let cached_root = self.get_cached(element.handle)?;
+        let hwnd = uia_call(|| unsafe { cached_root.CurrentNativeWindowHandle() })?;
+        if hwnd.0.is_null() {
+            return Err(Error::Platform {
+                code: -1,
+                message: "subscription root has no native window handle".to_owned(),
+            });
+        }
+        
+        // Event registration needs a live provider element. 
+        let app_root = uia_call(|| unsafe { self.automation.ElementFromHandle(hwnd) })?;
+        self.subscribe_impl(app_root, pid, app_name)
     }
 }
 
@@ -2595,11 +2588,13 @@ const PROPERTY_CHANGE_IDS: &[UIA_PROPERTY_ID] = &[
 ];
 
 impl WindowsProvider {
-    fn subscribe_impl(&self, pid: u32, app_name: String) -> Result<Subscription> {
+    fn subscribe_impl(
+        &self,
+        app_root: IUIAutomationElement,
+        pid: u32,
+        app_name: String,
+    ) -> Result<Subscription> {
         let (tx, rx) = std::sync::mpsc::channel::<Event>();
-
-        // Scope handler registrations to the target app's subtree.
-        let (app_root, _root_name) = self.find_app_by_pid(pid)?;
 
         let ctx = Arc::new(EventContext {
             sender: Mutex::new(tx),
@@ -3537,6 +3532,21 @@ mod tests {
             calls.set(calls.get() + 1);
             if calls.get() < TRANSIENT_RETRY_ATTEMPTS {
                 Err(subscriber_failure())
+            } else {
+                Ok("tree")
+            }
+        });
+        assert_eq!(result.unwrap(), "tree");
+        assert_eq!(calls.get(), TRANSIENT_RETRY_ATTEMPTS);
+    }
+
+    #[test]
+    fn uia_call_retries_uia_timeout_then_succeeds() {
+        let calls = std::cell::Cell::new(0u32);
+        let result = uia_call(|| {
+            calls.set(calls.get() + 1);
+            if calls.get() < TRANSIENT_RETRY_ATTEMPTS {
+                Err(UIA_E_TIMEOUT.ok().unwrap_err())
             } else {
                 Ok("tree")
             }

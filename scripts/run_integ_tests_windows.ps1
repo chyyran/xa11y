@@ -13,7 +13,7 @@ Write-Host "=== xa11y Windows integration test harness ==="
 
 # 1. Build everything
 Write-Host "Building workspace..."
-cargo build --workspace 2>&1 | Write-Host
+cargo build --workspace
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # 2. Launch the test application
@@ -28,11 +28,16 @@ try {
     # 3. Run integration tests
     Write-Host "Running integration tests..."
     if ($testFilter) {
-        cargo test -p xa11y --test integ_test -- --ignored --test-threads=1 $testFilter 2>&1 | Write-Host
+        cargo test -p xa11y --test integ_test -- --ignored --test-threads=1 $testFilter
     } else {
-        cargo test -p xa11y --test integ_test -- --ignored --test-threads=1 2>&1 | Write-Host
+        cargo test -p xa11y --test integ_test -- --ignored --test-threads=1
     }
     $testExit = $LASTEXITCODE
+    if ($testExit -eq 0 -and -not $testFilter) {
+        Write-Host "Running private-desktop HWND integration test..."
+        cargo test -p xa11y-windows --test native_window hwnd_root_actions_and_subscription_work_on_a_private_desktop -- --ignored --exact --test-threads=1
+        $testExit = $LASTEXITCODE
+    }
 } finally {
     # 4. Cleanup
     Write-Host "Cleaning up..."
